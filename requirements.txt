@@ -1,0 +1,5 @@
+# 3dskydb Python dependencies
+# Used by both local scrapers and GitHub Actions
+
+# No external deps needed — stdlib only (urllib, sqlite3, json, etc.)
+# If you add playwright or other tools, list them here.

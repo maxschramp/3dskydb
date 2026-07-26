@@ -1,0 +1,211 @@
+# 3dskydb — Automated Daily Scrape
+#
+# Runs every 6 hours. Seeds new slugs from sitemaps, then fetches model
+# details for any unfetched slugs. Posts data to the Cloudflare Worker API,
+# which writes to D1.
+#
+# Required GitHub Secrets:
+#   CF_WORKER_URL  — https://3dskydb-api.YOURSUB.workers.dev
+#   CF_API_KEY     — API key for Worker auth
+#   BRD_PROXY_URL  — Bright Data proxy URL (optional, for scraping)
+
+name: Scrape 3dsky
+
+on:
+  schedule:
+    # Every 6 hours (UTC)
+    - cron: "0 */6 * * *"
+  workflow_dispatch:  # manual trigger
+    inputs:
+      limit:
+        description: "Max models to fetch (0 = all pending)"
+        required: false
+        default: "0"
+      seed_only:
+        description: "Only seed new slugs, skip detail fetch"
+        required: false
+        default: "false"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5.5 hours (under 6h cycle)
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Step 1: Seed new slugs from sitemaps ───────────────────────
+      - name: Seed slugs from sitemaps
+        env:
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from cloudflare.client import CloudflareClient
+          from seed_from_sitemaps import (
+              SITEMAP_INDEX, rate_limited_fetch, parse_sitemap_index,
+              extract_model_slugs_from_sitemap_gz
+          )
+          import os, json
+
+          client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
+
+          # Fetch sitemap index
+          print('Fetching sitemap index...')
+          index_data = rate_limited_fetch(SITEMAP_INDEX)
+          sitemap_urls = parse_sitemap_index(index_data)
+          print(f'Found {len(sitemap_urls)} sitemap files')
+
+          # Extract all slugs
+          all_slugs = []
+          for url in sitemap_urls:
+              data = rate_limited_fetch(url)
+              slugs = extract_model_slugs_from_sitemap_gz(data)
+              all_slugs.extend(slugs)
+              print(f'  {url.split(\"/\")[-1]}: {len(slugs)} slugs')
+
+          unique = list(dict.fromkeys(all_slugs))
+          print(f'Total unique slugs: {len(unique):,}')
+
+          # Push to D1 via Worker
+          result = client.seed_slugs(unique)
+          print(f'Inserted: {result}')
+          "
+
+      # ── Step 2: Fetch model details ────────────────────────────────
+      - name: Fetch model details
+        if: ${{ github.event.inputs.seed_only != 'true' }}
+        env:
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          BRD_PROXY_URL: ${{ secrets.BRD_PROXY_URL }}
+          SCRAPE_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: |
+          python -c "
+          import sys, os, json, time
+          sys.path.insert(0, '.')
+          from cloudflare.client import CloudflareClient
+          from urllib.request import Request, urlopen, ProxyHandler, build_opener, install_opener
+          from urllib.error import HTTPError
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from threading import Lock
+
+          client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
+
+          # Proxy setup
+          proxy_url = os.environ.get('BRD_PROXY_URL', '')
+          if proxy_url:
+              ph = ProxyHandler({'http': proxy_url, 'https': proxy_url})
+              install_opener(build_opener(ph))
+              print(f'Proxy: enabled')
+          else:
+              print('Proxy: NONE (direct connection)')
+
+          UA = 'Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)'
+          limit = int(os.environ.get('SCRAPE_LIMIT', '0'))
+
+          # Get unfetched slugs
+          slugs = client.next_unfetched(limit if limit > 0 else 500)
+          print(f'Unfetched slugs: {len(slugs)}')
+
+          if not slugs:
+              print('Nothing to fetch. Done!')
+              sys.exit(0)
+
+          stats_lock = Lock()
+          stats = {'fetched': 0, 'errors': 0, 'start': time.monotonic()}
+
+          def fetch_endpoint(url, data, slug, name):
+              body = json.dumps(data).encode()
+              req = Request(url, data=body, headers={
+                  'User-Agent': UA,
+                  'Content-Type': 'application/json',
+                  'Referer': f'https://3dsky.org/3dmodels/show/{slug}',
+              })
+              for attempt in range(3):
+                  try:
+                      resp = urlopen(req, timeout=30)
+                      return json.loads(resp.read().decode()), len(resp.read())
+                  except HTTPError as e:
+                      if e.code == 429:
+                          time.sleep(2 * (attempt + 1))
+                          continue
+                      raise
+                  except Exception:
+                      if attempt < 2:
+                          time.sleep(1)
+                          continue
+                      raise
+              return None, 0
+
+          def scrape_one(slug):
+              try:
+                  detail, _ = fetch_endpoint(
+                      'https://models.3dsky.org/api/models/show',
+                      {'slug': slug}, slug, 'detail')
+                  if not detail or not detail.get('success'):
+                      raise Exception('detail API failed')
+
+                  tags, _ = fetch_endpoint(
+                      'https://tags.3dsky.org/api/tags/list',
+                      {'entity': 'model', 'slug': slug, 'locale': 'en'},
+                      slug, 'tags')
+                  tags_list = tags.get('data', []) if tags and tags.get('success') else []
+
+                  ok = client.store_detail(slug, detail['data'], tags_list)
+                  if not ok:
+                      raise Exception('Worker store_detail failed')
+
+                  with stats_lock:
+                      stats['fetched'] += 1
+                  return True
+              except Exception as e:
+                  with stats_lock:
+                      stats['errors'] += 1
+                  print(f'  ERROR {slug}: {e}')
+                  return False
+
+          # Process with thread pool
+          workers = 10  # conservative for CI
+          with ThreadPoolExecutor(max_workers=workers) as pool:
+              futures = {pool.submit(scrape_one, s): s for s in slugs}
+              for i, f in enumerate(as_completed(futures)):
+                  f.result()  # raise if exception
+                  if (i + 1) % 50 == 0:
+                      with stats_lock:
+                          elapsed = time.monotonic() - stats['start']
+                          rate = stats['fetched'] / (elapsed / 60) if elapsed > 0 else 0
+                          print(f'  Progress: {stats[\"fetched\"]}/{len(slugs)} '
+                                f'({rate:.0f}/min), {stats[\"errors\"]} errors')
+
+          elapsed = time.monotonic() - stats['start']
+          print(f'Done: {stats[\"fetched\"]} fetched, {stats[\"errors\"]} errors '
+                f'in {elapsed:.0f}s')
+          "
+
+      # ── Step 3: Report ─────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        env:
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        run: |
+          python -c "
+          import os, json
+          from cloudflare.client import CloudflareClient
+          client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
+          stats = client.stats()
+          print(json.dumps(stats, indent=2))
+          "

@@ -1,0 +1,17 @@
+{
+  "name": "3dskydb-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "db:init": "wrangler d1 execute 3dskydb --file=../schema.sql",
+    "db:shell": "wrangler d1 execute 3dskydb --command"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240725.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^4.114.0"
+  }
+}

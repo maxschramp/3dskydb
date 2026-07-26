@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# SQLite databases (local only — D1 is the source of truth)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Images (stay local, not in repo)
+model_images/
+
+# Cloudflare
+cloudflare/worker/node_modules/
+cloudflare/worker/.wrangler/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / env
+.env
+.env.local
+*.secret

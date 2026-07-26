@@ -1,0 +1,17 @@
+# 3dskydb Cloudflare Worker
+name = "3dskydb-api"
+main = "src/index.ts"
+compatibility_date = "2024-07-25"
+
+# D1 database binding — created with: npx wrangler d1 create 3dskydb
+[[d1_databases]]
+binding = "DB"
+database_name = "3dskydb"
+database_id = "05c0ecd1-8979-493d-8855-dd7f62a0b76f"  # fill after `npx wrangler d1 create 3dskydb`
+
+# Secrets (set via CLI, NOT committed):
+#   npx wrangler secret put API_KEY
+#   npx wrangler secret put ADMIN_API_KEY
+
+[observability]
+enabled = true
