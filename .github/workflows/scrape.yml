@@ -7,7 +7,6 @@
 # Required GitHub Secrets:
 #   CF_WORKER_URL  — https://3dskydb-api.YOURSUB.workers.dev
 #   CF_API_KEY     — API key for Worker auth
-#   BRD_PROXY_URL  — Bright Data proxy URL (optional, for scraping)
 
 name: Scrape 3dsky
 
@@ -90,30 +89,19 @@ jobs:
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          BRD_PROXY_URL: ${{ secrets.BRD_PROXY_URL }}
           SCRAPE_LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: |
           python -c "
           import sys, os, json, time
           sys.path.insert(0, '.')
           from cloudflare.client import CloudflareClient
-          from urllib.request import Request, urlopen, ProxyHandler, build_opener, install_opener
+          from urllib.request import Request, urlopen
           from urllib.error import HTTPError
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from threading import Lock
 
           client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
 
-          # Proxy setup
-          proxy_url = os.environ.get('BRD_PROXY_URL', '')
-          if proxy_url:
-              ph = ProxyHandler({'http': proxy_url, 'https': proxy_url})
-              install_opener(build_opener(ph))
-              print(f'Proxy: enabled')
-          else:
-              print('Proxy: NONE (direct connection)')
-
           UA = 'Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)'
+          RATE_LIMIT = 3.0  # seconds between requests
           limit = int(os.environ.get('SCRAPE_LIMIT', '0'))
 
           # Get unfetched slugs
@@ -124,10 +112,19 @@ jobs:
               print('Nothing to fetch. Done!')
               sys.exit(0)
 
-          stats_lock = Lock()
-          stats = {'fetched': 0, 'errors': 0, 'start': time.monotonic()}
+          fetched = 0
+          errors = 0
+          start = time.monotonic()
+          last_request = 0.0
 
-          def fetch_endpoint(url, data, slug, name):
+          def rate_limit():
+              nonlocal last_request
+              elapsed = time.monotonic() - last_request
+              if elapsed < RATE_LIMIT:
+                  time.sleep(RATE_LIMIT - elapsed)
+              last_request = time.monotonic()
+
+          def fetch_endpoint(url, data, slug):
               body = json.dumps(data).encode()
               req = Request(url, data=body, headers={
                   'User-Agent': UA,
@@ -136,63 +133,54 @@ jobs:
               })
               for attempt in range(3):
                   try:
+                      rate_limit()
                       resp = urlopen(req, timeout=30)
-                      return json.loads(resp.read().decode()), len(resp.read())
+                      raw = resp.read()
+                      return json.loads(raw.decode()), len(raw)
                   except HTTPError as e:
                       if e.code == 429:
-                          time.sleep(2 * (attempt + 1))
+                          wait = 5 * (attempt + 1)
+                          print(f'  429 rate limited, waiting {wait}s...')
+                          time.sleep(wait)
                           continue
                       raise
                   except Exception:
                       if attempt < 2:
-                          time.sleep(1)
+                          time.sleep(2)
                           continue
                       raise
               return None, 0
 
-          def scrape_one(slug):
+          for i, slug in enumerate(slugs):
               try:
                   detail, _ = fetch_endpoint(
                       'https://models.3dsky.org/api/models/show',
-                      {'slug': slug}, slug, 'detail')
+                      {'slug': slug}, slug)
                   if not detail or not detail.get('success'):
                       raise Exception('detail API failed')
 
                   tags, _ = fetch_endpoint(
                       'https://tags.3dsky.org/api/tags/list',
                       {'entity': 'model', 'slug': slug, 'locale': 'en'},
-                      slug, 'tags')
+                      slug)
                   tags_list = tags.get('data', []) if tags and tags.get('success') else []
 
                   ok = client.store_detail(slug, detail['data'], tags_list)
                   if not ok:
                       raise Exception('Worker store_detail failed')
 
-                  with stats_lock:
-                      stats['fetched'] += 1
-                  return True
+                  fetched += 1
+                  if (i + 1) % 10 == 0:
+                      elapsed = time.monotonic() - start
+                      rate = fetched / (elapsed / 60) if elapsed > 0 else 0
+                      print(f'  [{i+1}/{len(slugs)}] {slug} ({rate:.1f}/min)')
+
               except Exception as e:
-                  with stats_lock:
-                      stats['errors'] += 1
+                  errors += 1
                   print(f'  ERROR {slug}: {e}')
-                  return False
 
-          # Process with thread pool
-          workers = 10  # conservative for CI
-          with ThreadPoolExecutor(max_workers=workers) as pool:
-              futures = {pool.submit(scrape_one, s): s for s in slugs}
-              for i, f in enumerate(as_completed(futures)):
-                  f.result()  # raise if exception
-                  if (i + 1) % 50 == 0:
-                      with stats_lock:
-                          elapsed = time.monotonic() - stats['start']
-                          rate = stats['fetched'] / (elapsed / 60) if elapsed > 0 else 0
-                          print(f'  Progress: {stats[\"fetched\"]}/{len(slugs)} '
-                                f'({rate:.0f}/min), {stats[\"errors\"]} errors')
-
-          elapsed = time.monotonic() - stats['start']
-          print(f'Done: {stats[\"fetched\"]} fetched, {stats[\"errors\"]} errors '
-                f'in {elapsed:.0f}s')
+          elapsed = time.monotonic() - start
+          print(f'Done: {fetched} fetched, {errors} errors in {elapsed:.0f}s')
           "
 
       # ── Step 3: Report ─────────────────────────────────────────────
