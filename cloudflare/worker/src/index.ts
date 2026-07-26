@@ -81,11 +81,18 @@ async function handleSeed(request: Request, env: Env): Promise<Response> {
       return Response.json({ success: false, error: "slugs array required" }, { status: 400 });
     }
 
+    // D1 batch limit is 100 statements per call — chunk if needed
+    const D1_BATCH_MAX = 100;
     const stmt = env.DB.prepare("INSERT OR IGNORE INTO model (slug) VALUES (?)");
-    const batch = slugs.map((s) => stmt.bind(s));
-    const results = await env.DB.batch(batch);
+    let inserted = 0;
 
-    const inserted = results.filter((r) => r.meta.rows_written > 0).length;
+    for (let i = 0; i < slugs.length; i += D1_BATCH_MAX) {
+      const chunk = slugs.slice(i, i + D1_BATCH_MAX);
+      const batch = chunk.map((s) => stmt.bind(s));
+      const results = await env.DB.batch(batch);
+      inserted += results.filter((r) => r.meta.rows_written > 0).length;
+    }
+
     return Response.json({ success: true, received: slugs.length, inserted });
   } catch (e: any) {
     return Response.json({ success: false, error: e.message }, { status: 500 });

@@ -44,6 +44,8 @@ class CloudflareClient:
         req = Request(url, data=body, headers={
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "3dskydb-client/1.0",
+            "Accept": "application/json",
         })
         last_exc = None
         for attempt in range(3):
