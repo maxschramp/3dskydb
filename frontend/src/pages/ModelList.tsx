@@ -10,7 +10,7 @@ export default function ModelList() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const currentPage = parseInt(searchParams.get('page') || '1');
-  const currentLimit = parseInt(searchParams.get('limit') || '48');
+  const currentLimit = parseInt(searchParams.get('limit') || '25');
   const currentSearch = searchParams.get('search') || '';
   const currentCategory = searchParams.get('category') || '';
 

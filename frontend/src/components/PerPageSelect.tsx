@@ -3,7 +3,7 @@ interface Props {
   onChange: (value: string) => void;
 }
 
-const OPTIONS = [12, 24, 48, 96];
+const OPTIONS = [25, 50, 100];
 
 export default function PerPageSelect({ value, onChange }: Props) {
   return (
