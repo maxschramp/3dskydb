@@ -50,37 +50,36 @@ jobs:
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
         run: |
           python -c "
-          import sys
+          import sys, os
           sys.path.insert(0, '.')
           from cloudflare.client import CloudflareClient
-          from seed_from_sitemaps import (
-              SITEMAP_INDEX, rate_limited_fetch, parse_sitemap_index,
-              extract_model_slugs_from_sitemap_gz
-          )
-          import os, json
 
           client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
+          stats = client.stats()
 
-          # Fetch sitemap index
-          print('Fetching sitemap index...')
-          index_data = rate_limited_fetch(SITEMAP_INDEX)
-          sitemap_urls = parse_sitemap_index(index_data)
-          print(f'Found {len(sitemap_urls)} sitemap files')
+          if stats.get('total_models', 0) > 0:
+              print(f'DB already has {stats[\"total_models\"]:,} models — skipping seed.')
+          else:
+              from seed_from_sitemaps import (
+                  SITEMAP_INDEX, rate_limited_fetch, parse_sitemap_index,
+                  extract_model_slugs_from_sitemap_gz
+              )
+              print('Fetching sitemap index...')
+              index_data = rate_limited_fetch(SITEMAP_INDEX)
+              sitemap_urls = parse_sitemap_index(index_data)
+              print(f'Found {len(sitemap_urls)} sitemap files')
 
-          # Extract all slugs
-          all_slugs = []
-          for url in sitemap_urls:
-              data = rate_limited_fetch(url)
-              slugs = extract_model_slugs_from_sitemap_gz(data)
-              all_slugs.extend(slugs)
-              print(f'  {url.split(\"/\")[-1]}: {len(slugs)} slugs')
+              all_slugs = []
+              for url in sitemap_urls:
+                  data = rate_limited_fetch(url)
+                  slugs = extract_model_slugs_from_sitemap_gz(data)
+                  all_slugs.extend(slugs)
+                  print(f'  {url.split(\"/\")[-1]}: {len(slugs)} slugs')
 
-          unique = list(dict.fromkeys(all_slugs))
-          print(f'Total unique slugs: {len(unique):,}')
-
-          # Push to D1 via Worker
-          result = client.seed_slugs(unique)
-          print(f'Inserted: {result}')
+              unique = list(dict.fromkeys(all_slugs))
+              print(f'Total unique slugs: {len(unique):,}')
+              result = client.seed_slugs(unique)
+              print(f'Inserted: {result}')
           "
 
       # ── Step 2: Fetch model details ────────────────────────────────
