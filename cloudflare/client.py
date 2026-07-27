@@ -196,6 +196,8 @@ class CloudflareClient:
         url = f"{self.base_url}/api/stats"
         req = Request(url, headers={
             "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": "3dskydb-client/1.0",
+            "Accept": "application/json",
         })
         try:
             resp = urlopen(req, timeout=self.timeout)
