@@ -67,6 +67,11 @@ export default {
       return corsHeaders(await handleDetail(request, env));
     }
 
+    // ── POST /api/models/bulk — upsert many models at once ──
+    if (path === "/api/models/bulk" && request.method === "POST") {
+      return corsHeaders(await handleBulk(request, env));
+    }
+
     // ── POST /api/models/exists — check which slugs exist ──
     if (path === "/api/models/exists" && request.method === "POST") {
       return corsHeaders(await handleExists(request, env));
@@ -159,123 +164,151 @@ async function handleDetail(request: Request, env: Env): Promise<Response> {
       return Response.json({ success: false, error: "slug required" }, { status: 400 });
     }
 
-    // Build all SQL statements into one batch for atomicity
-    const statements: D1PreparedStatement[] = [];
-
-    // 1. Ensure row exists, then update (handles both new and existing slugs)
-    statements.push(
-      env.DB.prepare("INSERT OR IGNORE INTO model (slug) VALUES (?1)").bind(slug)
-    );
-    statements.push(
-      env.DB.prepare(`
-        UPDATE model SET
-          title = ?1, title_en = ?2, description = ?3, description_en = ?4,
-          type = ?5, type_text = ?6, style = ?7, style_en = ?8,
-          price = ?9, price_usd = ?10, polygons = ?11, size_kb = ?12,
-          length_cm = ?13, width_cm = ?14, height_cm = ?15,
-          platform = ?16, platform_en = ?17, render = ?18,
-          category_slug = ?19, category_title = ?20, category_title_en = ?21,
-          subcategory_slug = ?22, subcategory_title = ?23, subcategory_title_en = ?24,
-          form_id = ?25, form_title = ?26, form_title_en = ?27,
-          is_created_with_ai = ?28, version = ?29, created_at = ?30,
-          detail_fetched = 1, detail_fetched_at = datetime('now')
-        WHERE slug = ?31
-      `).bind(
-        body.title ?? null, body.title_en ?? null,
-        body.description ?? null, body.description_en ?? null,
-        body.type ?? null, body.type_text ?? null,
-        body.style ?? null, body.style_en ?? null,
-        body.price ?? null, body.price_usd ?? null,
-        body.polygons ?? null, body.size_kb ?? null,
-        body.length_cm ?? null, body.width_cm ?? null, body.height_cm ?? null,
-        body.platform ?? null, body.platform_en ?? null, body.render ?? null,
-        body.category_slug ?? null, body.category_title ?? null, body.category_title_en ?? null,
-        body.subcategory_slug ?? null, body.subcategory_title ?? null, body.subcategory_title_en ?? null,
-        body.form_id ?? null, body.form_title ?? null, body.form_title_en ?? null,
-        body.is_created_with_ai ? 1 : 0,
-        body.version ?? null, body.created_at ?? null,
-        slug
-      )
-    );
-
-    // We need the model id for child tables. D1 doesn't support RETURNING well,
-    // so we do a separate query after the update. For the batch, we'll use a
-    // subquery approach: delete children by slug-derived subquery, then insert.
-    // This avoids needing the integer id in the same transaction.
-
-    // 2. Delete and re-insert images
-    statements.push(
-      env.DB.prepare("DELETE FROM model_image WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
-    );
-    for (const img of body.images ?? []) {
-      statements.push(
-        env.DB.prepare(
-          "INSERT INTO model_image (model_id, web_path, sort) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3)"
-        ).bind(slug, img.web_path, img.sort ?? 0)
-      );
-    }
-
-    // 3. Delete and re-insert materials
-    statements.push(
-      env.DB.prepare("DELETE FROM model_material WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
-    );
-    for (const mat of body.materials ?? []) {
-      statements.push(
-        env.DB.prepare(
-          "INSERT INTO model_material (model_id, material, material_en) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3)"
-        ).bind(slug, mat.material ?? null, mat.material_en ?? null)
-      );
-    }
-
-    // 4. Delete and re-insert colors
-    statements.push(
-      env.DB.prepare("DELETE FROM model_color WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
-    );
-    for (const col of body.colors ?? []) {
-      statements.push(
-        env.DB.prepare(
-          "INSERT INTO model_color (model_id, hex, title, title_en) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3, ?4)"
-        ).bind(slug, col.hex ?? null, col.title ?? null, col.title_en ?? null)
-      );
-    }
-
-    // 5. Delete and re-insert formats
-    statements.push(
-      env.DB.prepare("DELETE FROM model_format WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
-    );
-    for (const fmt of body.formats ?? []) {
-      statements.push(
-        env.DB.prepare(
-          "INSERT INTO model_format (model_id, title) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2)"
-        ).bind(slug, fmt.title ?? null)
-      );
-    }
-
-    // 6. Delete and re-insert tags
-    statements.push(
-      env.DB.prepare("DELETE FROM model_tag WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
-    );
-    for (const tag of body.tags ?? []) {
-      const tagTitle = tag.title;
-      if (!tagTitle) continue;
-      // Upsert tag, then link
-      statements.push(
-        env.DB.prepare("INSERT OR IGNORE INTO tag (title, multiple) VALUES (?1, ?2)").bind(tagTitle, tag.multiple ?? 1)
-      );
-      statements.push(
-        env.DB.prepare(
-          "INSERT OR IGNORE INTO model_tag (model_id, tag_id) VALUES ((SELECT id FROM model WHERE slug = ?1), (SELECT id FROM tag WHERE title = ?2))"
-        ).bind(slug, tagTitle)
-      );
-    }
-
-    // Execute entire batch (D1 batches are atomic per https://developers.cloudflare.com/d1/)
+    const statements = buildModelStatements(body, env);
     await env.DB.batch(statements);
 
     return Response.json({ success: true, slug });
   } catch (e: any) {
     return Response.json({ success: false, error: e.message }, { status: 500 });
   }
+}
+
+/** POST /api/models/bulk — body: { models: ModelDetailPayload[] } */
+async function handleBulk(request: Request, env: Env): Promise<Response> {
+  try {
+    const { models } = (await request.json()) as { models: ModelDetailPayload[] };
+    if (!Array.isArray(models) || models.length === 0) {
+      return Response.json({ success: false, error: "models array required" }, { status: 400 });
+    }
+
+    let succeeded = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (const body of models) {
+      try {
+        const statements = buildModelStatements(body, env);
+        await env.DB.batch(statements);
+        succeeded++;
+      } catch (e: any) {
+        failed++;
+        errors.push(`${body.slug}: ${e.message}`);
+      }
+    }
+
+    return Response.json({ success: true, received: models.length, succeeded, failed, errors: errors.slice(0, 10) });
+  } catch (e: any) {
+    return Response.json({ success: false, error: e.message }, { status: 500 });
+  }
+}
+
+/** Build D1 batch statements for a single model upsert */
+function buildModelStatements(body: ModelDetailPayload, env: Env): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = [];
+  const { slug } = body;
+
+  // 1. Ensure row exists, then update
+  statements.push(
+    env.DB.prepare("INSERT OR IGNORE INTO model (slug) VALUES (?1)").bind(slug)
+  );
+  statements.push(
+    env.DB.prepare(`
+      UPDATE model SET
+        title = ?1, title_en = ?2, description = ?3, description_en = ?4,
+        type = ?5, type_text = ?6, style = ?7, style_en = ?8,
+        price = ?9, price_usd = ?10, polygons = ?11, size_kb = ?12,
+        length_cm = ?13, width_cm = ?14, height_cm = ?15,
+        platform = ?16, platform_en = ?17, render = ?18,
+        category_slug = ?19, category_title = ?20, category_title_en = ?21,
+        subcategory_slug = ?22, subcategory_title = ?23, subcategory_title_en = ?24,
+        form_id = ?25, form_title = ?26, form_title_en = ?27,
+        is_created_with_ai = ?28, version = ?29, created_at = ?30,
+        detail_fetched = 1, detail_fetched_at = datetime('now')
+      WHERE slug = ?31
+    `).bind(
+      body.title ?? null, body.title_en ?? null,
+      body.description ?? null, body.description_en ?? null,
+      body.type ?? null, body.type_text ?? null,
+      body.style ?? null, body.style_en ?? null,
+      body.price ?? null, body.price_usd ?? null,
+      body.polygons ?? null, body.size_kb ?? null,
+      body.length_cm ?? null, body.width_cm ?? null, body.height_cm ?? null,
+      body.platform ?? null, body.platform_en ?? null, body.render ?? null,
+      body.category_slug ?? null, body.category_title ?? null, body.category_title_en ?? null,
+      body.subcategory_slug ?? null, body.subcategory_title ?? null, body.subcategory_title_en ?? null,
+      body.form_id ?? null, body.form_title ?? null, body.form_title_en ?? null,
+      body.is_created_with_ai ? 1 : 0,
+      body.version ?? null, body.created_at ?? null,
+      slug
+    )
+  );
+
+  // 2. Images
+  statements.push(
+    env.DB.prepare("DELETE FROM model_image WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
+  );
+  for (const img of body.images ?? []) {
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO model_image (model_id, web_path, sort) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3)"
+      ).bind(slug, img.web_path, img.sort ?? 0)
+    );
+  }
+
+  // 3. Materials
+  statements.push(
+    env.DB.prepare("DELETE FROM model_material WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
+  );
+  for (const mat of body.materials ?? []) {
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO model_material (model_id, material, material_en) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3)"
+      ).bind(slug, mat.material ?? null, mat.material_en ?? null)
+    );
+  }
+
+  // 4. Colors
+  statements.push(
+    env.DB.prepare("DELETE FROM model_color WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
+  );
+  for (const col of body.colors ?? []) {
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO model_color (model_id, hex, title, title_en) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2, ?3, ?4)"
+      ).bind(slug, col.hex ?? null, col.title ?? null, col.title_en ?? null)
+    );
+  }
+
+  // 5. Formats
+  statements.push(
+    env.DB.prepare("DELETE FROM model_format WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
+  );
+  for (const fmt of body.formats ?? []) {
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO model_format (model_id, title) VALUES ((SELECT id FROM model WHERE slug = ?1), ?2)"
+      ).bind(slug, fmt.title ?? null)
+    );
+  }
+
+  // 6. Tags
+  statements.push(
+    env.DB.prepare("DELETE FROM model_tag WHERE model_id = (SELECT id FROM model WHERE slug = ?1)").bind(slug)
+  );
+  for (const tag of body.tags ?? []) {
+    const tagTitle = tag.title;
+    if (!tagTitle) continue;
+    statements.push(
+      env.DB.prepare("INSERT OR IGNORE INTO tag (title, multiple) VALUES (?1, ?2)").bind(tagTitle, tag.multiple ?? 1)
+    );
+    statements.push(
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO model_tag (model_id, tag_id) VALUES ((SELECT id FROM model WHERE slug = ?1), (SELECT id FROM tag WHERE title = ?2))"
+      ).bind(slug, tagTitle)
+    );
+  }
+
+  return statements;
 }
 
 /** POST /api/models/exists — body: { slugs: string[] } → { existing: string[] } */
@@ -455,45 +488,40 @@ async function handleListModels(request: Request, env: Env): Promise<Response> {
     const category = (url.searchParams.get("category") || "").trim();
     const offset = (page - 1) * limit;
 
-    const conditions: string[] = ["detail_fetched = 1"];
-    const params: any[] = [];
+    // Build WHERE clause with numbered params — show ALL models, not just fetched ones
+    const conditions: string[] = [];
+    const values: any[] = [];
 
     if (search) {
-      conditions.push("(title LIKE ?1 OR title_en LIKE ?1 OR slug LIKE ?1)");
-      params.push(`%${search}%`);
+      values.push(`%${search}%`);
+      conditions.push(`(title LIKE ?${values.length} OR title_en LIKE ?${values.length} OR slug LIKE ?${values.length})`);
     }
     if (category) {
-      conditions.push("category_slug = ?2");
-      params.push(category);
+      values.push(category);
+      conditions.push(`category_slug = ?${values.length}`);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-    // Count total matching
+    // Count total matching — only bind if there are values
     let countSql = `SELECT COUNT(*) as c FROM model ${where}`;
-    let countStmt = env.DB.prepare(countSql);
-    for (let i = 0; i < params.length; i++) {
-      countStmt = countStmt.bind(params[i]);
-    }
-    const countRow = await countStmt.first<{ c: number }>();
+    const countRow = values.length > 0
+      ? await env.DB.prepare(countSql).bind(...values).first<{ c: number }>()
+      : await env.DB.prepare(countSql).first<{ c: number }>();
     const total = countRow?.c ?? 0;
 
-    // Fetch page
-    let sql = `SELECT id, slug, title, title_en, type_text, price_usd, polygons,
-                      category_slug, category_title, category_title_en,
-                      subcategory_title, subcategory_title_en,
-                      platform, render, created_at
-               FROM model ${where}
-               ORDER BY id DESC
-               LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`;
+    // Fetch page — LIMIT/OFFSET are integer literals (safe from injection since we parseInt them)
+    const sql = `SELECT id, slug, title, title_en, type_text, price_usd, polygons,
+                        category_slug, category_title, category_title_en,
+                        subcategory_title, subcategory_title_en,
+                        platform, render, created_at, slug_seeded_at
+                 FROM model ${where}
+                 ORDER BY id DESC
+                 LIMIT ${limit} OFFSET ${offset}`;
 
-    let stmt = env.DB.prepare(sql);
-    for (let i = 0; i < params.length; i++) {
-      stmt = stmt.bind(params[i]);
-    }
-    stmt = stmt.bind(limit).bind(offset);
-
-    const rows = await stmt.all<ModelListRow>();
+    const rows = values.length > 0
+      ? await env.DB.prepare(sql).bind(...values).all<ModelListRow>()
+      : await env.DB.prepare(sql).all<ModelListRow>();
 
     // Get first image for each model in this page
     const modelIds = rows.results.map((r) => r.id);
@@ -514,11 +542,11 @@ async function handleListModels(request: Request, env: Env): Promise<Response> {
   }
 }
 
-/** GET /api/models/:slug — full model detail with children */
+/** GET /api/models/:slug — full model detail with children (works even without detail_fetched) */
 async function handleGetModel(slug: string, env: Env): Promise<Response> {
   try {
     const model = await env.DB.prepare(
-      `SELECT * FROM model WHERE slug = ?1 AND detail_fetched = 1`
+      `SELECT * FROM model WHERE slug = ?1`
     ).bind(slug).first<ModelRow>();
 
     if (!model) {
@@ -557,7 +585,7 @@ async function handleCategories(env: Env): Promise<Response> {
   try {
     const rows = await env.DB.prepare(
       `SELECT category_slug, category_title, category_title_en, COUNT(*) as count
-       FROM model WHERE detail_fetched = 1 AND category_slug IS NOT NULL
+       FROM model WHERE category_slug IS NOT NULL
        GROUP BY category_slug
        ORDER BY count DESC`
     ).all<{ category_slug: string; category_title: string | null; category_title_en: string | null; count: number }>();
