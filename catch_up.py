@@ -11,7 +11,7 @@ import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloudflare.client import CloudflareClient
 
 client = CloudflareClient(os.environ["CF_WORKER_URL"], os.environ["CF_API_KEY"])
@@ -94,11 +94,13 @@ def main():
 
     for page in range(1, MAX_PAGES + 1):
         listing = fetch_json("https://3dsky.org/api/models", {"page": page})
-        if not listing or not listing.get("success"):
+        if not listing:
             print(f"  Listing API failed on page {page}")
             break
-
-        models = listing.get("data", {}).get("models", [])
+        models = listing.get("data", {}).get("models")
+        if models is None:
+            print(f"  Listing API returned no models on page {page}")
+            break
         if not models:
             print(f"  Page {page}: empty, stopping.")
             break
@@ -126,7 +128,7 @@ def main():
                     {"slug": slug},
                     {"Referer": f"https://3dsky.org/3dmodels/show/{slug}"},
                 )
-                if not detail or not detail.get("success"):
+                if not detail or not detail.get("data"):
                     raise Exception("detail API failed")
 
                 tags = fetch_json(
@@ -134,7 +136,7 @@ def main():
                     {"entity": "model", "slug": slug, "locale": "en"},
                     {"Referer": f"https://3dsky.org/3dmodels/show/{slug}"},
                 )
-                tags_list = tags.get("data", []) if tags and tags.get("success") else []
+                tags_list = tags.get("data", []) if tags else []
 
                 ok = client.store_detail(slug, detail["data"], tags_list)
                 if not ok:
