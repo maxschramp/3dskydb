@@ -32,8 +32,8 @@ UA = "Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)"
 # ── CLI ─────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Download 3dsky model preview images")
 parser.add_argument("--proxy", type=str,
-                    default="http://REDACTED_USER:REDACTED_PASS@brd.superproxy.io:33335",
-                    help="Proxy URL, or comma-separated list for round-robin")
+                    default=os.environ.get("BRD_PROXY_URL", ""),
+                    help="Proxy URL (set BRD_PROXY_URL env var or pass --proxy), or comma-separated for round-robin")
 parser.add_argument("--no-proxy", action="store_true",
                     help="Connect directly (no proxy)")
 parser.add_argument("--workers", type=int, default=50,

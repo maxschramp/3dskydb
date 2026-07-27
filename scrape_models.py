@@ -32,8 +32,8 @@ UA = "Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)"
 # ── CLI ─────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Scrape 3dsky.org model details")
 parser.add_argument("--proxy", type=str,
-                    default="http://REDACTED_USER:REDACTED_PASS@brd.superproxy.io:33335",
-                    help="Proxy URL (default: Bright Data datacenter)")
+                    default=os.environ.get("BRD_PROXY_URL", ""),
+                    help="Proxy URL (set BRD_PROXY_URL env var or pass --proxy)")
 parser.add_argument("--no-proxy", action="store_true",
                     help="Disable proxy, connect directly")
 parser.add_argument("--workers", type=int, default=20,
@@ -49,7 +49,7 @@ parser.add_argument("--dry-run", action="store_true",
 args = parser.parse_args()
 
 # ── Proxy setup ──────────────────────────────────────────────────────
-if args.no_proxy:
+if args.no_proxy or not args.proxy:
     print("Proxy: NONE (direct connection)")
 else:
     proxy_display = args.proxy

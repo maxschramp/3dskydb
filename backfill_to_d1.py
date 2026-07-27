@@ -26,7 +26,7 @@ UA = "3dskydb-backfill/1.0"
 
 parser = argparse.ArgumentParser(description="Backfill D1 from local SQLite")
 parser.add_argument("--worker-url", type=str,
-                    default=os.environ.get("CF_WORKER_URL", "https://3dskydb-api.maxschramp.workers.dev"))
+                    default=os.environ.get("CF_WORKER_URL", ""))
 parser.add_argument("--api-key", type=str,
                     default=os.environ.get("CF_API_KEY", ""))
 parser.add_argument("--workers", type=int, default=15,
