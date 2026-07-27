@@ -118,7 +118,7 @@ jobs:
           last_request = 0.0
 
           def rate_limit():
-              nonlocal last_request
+              global last_request
               elapsed = time.monotonic() - last_request
               if elapsed < RATE_LIMIT:
                   time.sleep(RATE_LIMIT - elapsed)
