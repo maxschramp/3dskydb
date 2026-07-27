@@ -88,28 +88,18 @@ jobs:
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          BRD_PROXY_URL: ${{ secrets.BRD_PROXY_URL }}
         run: |
           python -c "
           import sys, os, json, time
           sys.path.insert(0, '.')
           from cloudflare.client import CloudflareClient
-          from urllib.request import Request, urlopen, ProxyHandler, build_opener, install_opener
-          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
 
           client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
           UA = 'Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)'
           DELAY = 3.0  # seconds between 3dsky API calls
-
-          # Proxy setup (for 3dsky.org calls only — Worker API stays direct)
-          proxy_url = os.environ.get('BRD_PROXY_URL', '')
-          has_proxy = bool(proxy_url)
-          if has_proxy:
-              proxy_handler = ProxyHandler({'http': proxy_url, 'https': proxy_url})
-              proxy_opener = build_opener(proxy_handler)
-              print(f'Proxy: enabled')
-          else:
-              print(f'Proxy: NONE (direct)')
+          WORKER = os.environ['CF_WORKER_URL']
 
           last_req = 0.0
           def throttle():
@@ -120,50 +110,49 @@ jobs:
               last_req = time.monotonic()
 
           def fetch_json(url, data=None, extra_headers=None):
-              \"\"\"Fetch JSON from 3dsky API. Tries proxy first, falls back to direct.\"\"\"
-              body = json.dumps(data).encode() if data else None
-              headers = {'User-Agent': UA, 'Content-Type': 'application/json'}
+              \"\"\"Fetch JSON from 3dsky API via Worker proxy.\"\"\"
+              headers = {}
               if extra_headers:
                   headers.update(extra_headers)
-
-              # Try proxy first, then direct
-              methods = [(proxy_opener, 'proxy')] if has_proxy else []
-              methods.append((None, 'direct'))  # None = use default opener
-
-              for opener, method_name in methods:
-                  for attempt in range(3):
-                      try:
-                          throttle()
-                          req = Request(url, data=body, headers=headers)
-                          if opener:
-                              resp = opener.open(req, timeout=30)
-                          else:
-                              resp = urlopen(req, timeout=30)
-                          return json.loads(resp.read().decode())
-                      except HTTPError as e:
-                          if e.code == 429:
-                              wait = 5 * (attempt + 1)
-                              print(f'  429 ({method_name}), waiting {wait}s...')
-                              time.sleep(wait)
-                              continue
-                          # 403/407 = proxy auth/access denied — try next method
-                          if e.code in (403, 407) and method_name == 'proxy':
-                              print(f'  Proxy returned {e.code}, falling back to direct...')
-                              break  # break retry loop, fall through to direct
-                          raise
-                      except (URLError, OSError) as e:
-                          if method_name == 'proxy':
-                              print(f'  Proxy connection failed, falling back to direct...')
-                              break
+              proxy_body = {
+                  'url': url,
+                  'method': 'POST' if data else 'GET',
+                  'headers': headers,
+                  'body': data,
+              }
+              body = json.dumps(proxy_body).encode()
+              for attempt in range(3):
+                  try:
+                      throttle()
+                      req = Request(f'{WORKER}/api/proxy', data=body, headers={
+                          'Authorization': f'Bearer {os.environ[\"CF_API_KEY\"]}',
+                          'Content-Type': 'application/json',
+                          'User-Agent': UA,
+                      })
+                      resp = urlopen(req, timeout=30)
+                      result = json.loads(resp.read().decode())
+                      if result.get('success'):
+                          parsed = json.loads(result['body'])
+                          return parsed
+                      else:
+                          print(f'  Proxy error: {result.get(\"error\", \"unknown\")}')
                           if attempt < 2:
                               time.sleep(2)
                               continue
-                          raise
-                      except Exception:
-                          if attempt < 2:
-                              time.sleep(2)
-                              continue
-                          raise
+                          return None
+                  except HTTPError as e:
+                      if e.code == 429:
+                          wait = 5 * (attempt + 1)
+                          print(f'  429, waiting {wait}s...')
+                          time.sleep(wait)
+                          continue
+                      raise
+                  except Exception as ex:
+                      if attempt < 2:
+                          time.sleep(2)
+                          continue
+                      print(f'  Proxy request failed: {ex}')
+                      return None
               return None
 
           fetched = 0
