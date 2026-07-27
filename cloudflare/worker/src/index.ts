@@ -62,6 +62,11 @@ export default {
       return handleDetail(request, env);
     }
 
+    // ── POST /api/models/exists — check which slugs exist ──
+    if (path === "/api/models/exists" && request.method === "POST") {
+      return handleExists(request, env);
+    }
+
     // ── GET /api/stats ──
     if (path === "/api/stats" && request.method === "GET") {
       return handleStats(env);
@@ -129,7 +134,10 @@ async function handleDetail(request: Request, env: Env): Promise<Response> {
     // Build all SQL statements into one batch for atomicity
     const statements: D1PreparedStatement[] = [];
 
-    // 1. Upsert model row
+    // 1. Ensure row exists, then update (handles both new and existing slugs)
+    statements.push(
+      env.DB.prepare("INSERT OR IGNORE INTO model (slug) VALUES (?1)").bind(slug)
+    );
     statements.push(
       env.DB.prepare(`
         UPDATE model SET
@@ -237,6 +245,29 @@ async function handleDetail(request: Request, env: Env): Promise<Response> {
     await env.DB.batch(statements);
 
     return Response.json({ success: true, slug });
+  } catch (e: any) {
+    return Response.json({ success: false, error: e.message }, { status: 500 });
+  }
+}
+
+/** POST /api/models/exists — body: { slugs: string[] } → { existing: string[] } */
+async function handleExists(request: Request, env: Env): Promise<Response> {
+  try {
+    const { slugs } = (await request.json()) as { slugs: string[] };
+    if (!Array.isArray(slugs) || slugs.length === 0) {
+      return Response.json({ success: false, error: "slugs array required" }, { status: 400 });
+    }
+
+    // D1 doesn't support WHERE slug IN (?,?,?) with dynamic length well,
+    // so we query one at a time. For small batches this is fine.
+    const existing: string[] = [];
+    const stmt = env.DB.prepare("SELECT 1 FROM model WHERE slug = ?1 LIMIT 1");
+    for (const slug of slugs) {
+      const row = await stmt.bind(slug).first();
+      if (row) existing.push(slug);
+    }
+
+    return Response.json({ success: true, existing });
   } catch (e: any) {
     return Response.json({ success: false, error: e.message }, { status: 500 });
   }

@@ -13,6 +13,7 @@ venv/
 
 # Images (stay local, not in repo)
 model_images/
+*.zip
 
 # Cloudflare
 cloudflare/worker/node_modules/

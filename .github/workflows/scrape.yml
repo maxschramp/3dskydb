@@ -82,13 +82,12 @@ jobs:
               print(f'Inserted: {result}')
           "
 
-      # ── Step 2: Fetch model details ────────────────────────────────
-      - name: Fetch model details
+      # ── Step 2: Catch up on new models ───────────────────────────
+      - name: Catch up on new models
         if: ${{ github.event.inputs.seed_only != 'true' }}
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          SCRAPE_LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: |
           python -c "
           import sys, os, json, time
@@ -98,48 +97,32 @@ jobs:
           from urllib.error import HTTPError
 
           client = CloudflareClient(os.environ['CF_WORKER_URL'], os.environ['CF_API_KEY'])
-
           UA = 'Mozilla/5.0 (compatible; 3dskydb-scraper/1.0)'
-          RATE_LIMIT = 3.0  # seconds between requests
-          limit = int(os.environ.get('SCRAPE_LIMIT', '0'))
+          DELAY = 3.0  # seconds between 3dsky API calls
 
-          # Get unfetched slugs
-          slugs = client.next_unfetched(limit if limit > 0 else 500)
-          print(f'Unfetched slugs: {len(slugs)}')
+          last_req = 0.0
+          def throttle():
+              global last_req
+              elapsed = time.monotonic() - last_req
+              if elapsed < DELAY:
+                  time.sleep(DELAY - elapsed)
+              last_req = time.monotonic()
 
-          if not slugs:
-              print('Nothing to fetch. Done!')
-              sys.exit(0)
-
-          fetched = 0
-          errors = 0
-          start = time.monotonic()
-          last_request = 0.0
-
-          def rate_limit():
-              global last_request
-              elapsed = time.monotonic() - last_request
-              if elapsed < RATE_LIMIT:
-                  time.sleep(RATE_LIMIT - elapsed)
-              last_request = time.monotonic()
-
-          def fetch_endpoint(url, data, slug):
-              body = json.dumps(data).encode()
-              req = Request(url, data=body, headers={
-                  'User-Agent': UA,
-                  'Content-Type': 'application/json',
-                  'Referer': f'https://3dsky.org/3dmodels/show/{slug}',
-              })
+          def fetch_json(url, data=None, extra_headers=None):
+              body = json.dumps(data).encode() if data else None
+              headers = {'User-Agent': UA, 'Content-Type': 'application/json'}
+              if extra_headers:
+                  headers.update(extra_headers)
               for attempt in range(3):
                   try:
-                      rate_limit()
+                      throttle()
+                      req = Request(url, data=body, headers=headers)
                       resp = urlopen(req, timeout=30)
-                      raw = resp.read()
-                      return json.loads(raw.decode()), len(raw)
+                      return json.loads(resp.read().decode())
                   except HTTPError as e:
                       if e.code == 429:
                           wait = 5 * (attempt + 1)
-                          print(f'  429 rate limited, waiting {wait}s...')
+                          print(f'  429, waiting {wait}s...')
                           time.sleep(wait)
                           continue
                       raise
@@ -148,38 +131,77 @@ jobs:
                           time.sleep(2)
                           continue
                       raise
-              return None, 0
+              return None
 
-          for i, slug in enumerate(slugs):
-              try:
-                  detail, _ = fetch_endpoint(
-                      'https://models.3dsky.org/api/models/show',
-                      {'slug': slug}, slug)
-                  if not detail or not detail.get('success'):
-                      raise Exception('detail API failed')
+          fetched = 0
+          errors = 0
+          pages_checked = 0
+          consecutive_existing = 0
+          MAX_CONSECUTIVE = 20
+          MAX_PAGES = 200  # safety limit
+          start = time.monotonic()
 
-                  tags, _ = fetch_endpoint(
-                      'https://tags.3dsky.org/api/tags/list',
-                      {'entity': 'model', 'slug': slug, 'locale': 'en'},
-                      slug)
-                  tags_list = tags.get('data', []) if tags and tags.get('success') else []
+          print('Catching up on new models from listing API...')
 
-                  ok = client.store_detail(slug, detail['data'], tags_list)
-                  if not ok:
-                      raise Exception('Worker store_detail failed')
+          for page in range(1, MAX_PAGES + 1):
+              listing = fetch_json('https://3dsky.org/api/models', {'page': page})
+              if not listing or not listing.get('success'):
+                  print(f'  Listing API failed on page {page}')
+                  break
 
-                  fetched += 1
-                  if (i + 1) % 10 == 0:
-                      elapsed = time.monotonic() - start
-                      rate = fetched / (elapsed / 60) if elapsed > 0 else 0
-                      print(f'  [{i+1}/{len(slugs)}] {slug} ({rate:.1f}/min)')
+              models = listing.get('data', {}).get('models', [])
+              if not models:
+                  print(f'  Page {page}: empty, stopping.')
+                  break
 
-              except Exception as e:
-                  errors += 1
-                  print(f'  ERROR {slug}: {e}')
+              pages_checked += 1
+              slugs = [m['slug'] for m in models if m.get('slug')]
+              existing = client.check_exists(slugs)
+              new_slugs = [s for s in slugs if s not in existing]
+
+              if not new_slugs:
+                  consecutive_existing += len(slugs)
+                  print(f'  Page {page}: all {len(slugs)} exist ({consecutive_existing} consecutive)')
+                  if consecutive_existing >= MAX_CONSECUTIVE:
+                      print(f'  Stopping: {consecutive_existing} consecutive existing models.')
+                      break
+                  continue
+
+              consecutive_existing = 0
+              print(f'  Page {page}: {len(new_slugs)} new of {len(slugs)}')
+
+              for slug in new_slugs:
+                  try:
+                      detail = fetch_json(
+                          'https://models.3dsky.org/api/models/show',
+                          {'slug': slug},
+                          {'Referer': f'https://3dsky.org/3dmodels/show/{slug}'}
+                      )
+                      if not detail or not detail.get('success'):
+                          raise Exception('detail API failed')
+
+                      tags = fetch_json(
+                          'https://tags.3dsky.org/api/tags/list',
+                          {'entity': 'model', 'slug': slug, 'locale': 'en'},
+                          {'Referer': f'https://3dsky.org/3dmodels/show/{slug}'}
+                      )
+                      tags_list = tags.get('data', []) if tags and tags.get('success') else []
+
+                      ok = client.store_detail(slug, detail['data'], tags_list)
+                      if not ok:
+                          raise Exception('store_detail failed')
+
+                      fetched += 1
+                  except Exception as e:
+                      errors += 1
+                      print(f'    ERROR {slug}: {e}')
+
+              if pages_checked % 5 == 0:
+                  elapsed = time.monotonic() - start
+                  print(f'  [{pages_checked} pages] {fetched} new, {errors} errors, {elapsed:.0f}s')
 
           elapsed = time.monotonic() - start
-          print(f'Done: {fetched} fetched, {errors} errors in {elapsed:.0f}s')
+          print(f'Done: {pages_checked} pages, {fetched} new models, {errors} errors in {elapsed:.0f}s')
           "
 
       # ── Step 3: Report ─────────────────────────────────────────────

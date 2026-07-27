@@ -177,6 +177,18 @@ class CloudflareClient:
         result = self._post("/api/models/detail", payload)
         return result.get("success", False)
 
+    # ── Check which slugs exist ──────────────────────────────────────
+
+    def check_exists(self, slugs: list[str]) -> set[str]:
+        """Return the subset of slugs that already exist in D1."""
+        if not slugs:
+            return set()
+        result = self._post("/api/models/exists", {"slugs": slugs})
+        if result.get("success"):
+            return set(result.get("existing", []))
+        print(f"  WARN: exists check failed: {result.get('error')}")
+        return set()
+
     # ── Stats ────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
