@@ -15,6 +15,7 @@ export interface ModelSummary {
   platform: string | null;
   render: string | null;
   created_at: string | null;
+  slug_seeded_at: string | null;
   first_image: string | null;
 }
 
@@ -53,6 +54,8 @@ export interface ModelDetail {
   is_created_with_ai: number | null;
   version: string | null;
   created_at: string | null;
+  slug_seeded_at: string | null;
+  detail_fetched_at: string | null;
   images: ModelImage[];
   materials: ModelMaterial[];
   colors: ModelColor[];

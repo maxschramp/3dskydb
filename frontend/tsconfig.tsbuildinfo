@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/categoryfilter.tsx","./src/components/modelcard.tsx","./src/components/paginationbar.tsx","./src/components/perpageselect.tsx","./src/components/searchbar.tsx","./src/components/sidebar.tsx","./src/pages/modeldetail.tsx","./src/pages/modellist.tsx"],"version":"5.9.3"}

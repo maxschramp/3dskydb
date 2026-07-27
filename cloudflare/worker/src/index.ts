@@ -516,7 +516,7 @@ async function handleListModels(request: Request, env: Env): Promise<Response> {
                         subcategory_title, subcategory_title_en,
                         platform, render, created_at, slug_seeded_at
                  FROM model ${where}
-                 ORDER BY id DESC
+                 ORDER BY COALESCE(version, created_at, slug_seeded_at) DESC
                  LIMIT ${limit} OFFSET ${offset}`;
 
     const rows = values.length > 0
