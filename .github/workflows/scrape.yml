@@ -28,6 +28,10 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # The state step below pushes with the workflow token, which is read-only
+    # by default on repositories created recently.
+    permissions:
+      contents: write
     timeout-minutes: 330  # 5.5 hours (under 6h cycle)
 
     steps:
@@ -104,3 +108,17 @@ jobs:
           stats = client.stats()
           print(json.dumps(stats, indent=2))
           "
+
+      # Keepalive with purpose. GitHub disables scheduled workflows after 60
+      # days without a push, and workflow runs do not count as activity, so
+      # this writes a tiny state file and commits it every run. The counter
+      # also leaves a cheap run history without opening the Actions tab.
+      - name: Record run state
+        if: always()
+        run: |
+          python -c "import json,os,datetime; p='scrape-state.json'; s=json.load(open(p)) if os.path.exists(p) else {}; s.update({'last_run': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'runs': int(s.get('runs', 0)) + 1, 'last_run_id': os.environ.get('GITHUB_RUN_ID')}); json.dump(s, open(p, 'w'), indent=2, sort_keys=True)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scrape-state.json
+          git diff --cached --quiet || git commit -m "Record scrape run [skip ci]"
+          git push origin HEAD:master
